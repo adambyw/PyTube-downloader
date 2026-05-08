@@ -1,0 +1,3 @@
+pytubefix==10.6.1
+PyQt6>=1
+validator
