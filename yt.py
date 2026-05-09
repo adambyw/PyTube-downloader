@@ -1,4 +1,4 @@
-import sys
+import sys, time, os, re, subprocess
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QTextBrowser,
@@ -7,11 +7,9 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QUrl
 from urllib.parse import urlparse, parse_qs
-import time
-import os
-import subprocess
 from pytubefix import YouTube, Playlist
 from pathlib import Path
+from progressbar import ProgressItem, ProgressDelegate
 
 class UserBreakException(Exception):
     pass
@@ -32,6 +30,7 @@ MODE_VIDEO = 2
 ROLE_URL = Qt.ItemDataRole.UserRole
 ROLE_STATUS = Qt.ItemDataRole.UserRole + 1
 ROLE_FOLDER = Qt.ItemDataRole.UserRole + 2
+ROLE_PRECENT = Qt.ItemDataRole.UserRole + 3
 
 STATUS_PENDING =     Status( 1, "⏳")
 STATUS_DOWNLOADING = Status( 2, "🔽")
@@ -40,6 +39,24 @@ STATUS_FINISHED =    Status( 4, "✅")
 STATUS_ERROR =       Status(-1, "❌")
 STATUS_USER_BREAK =  Status(-2, "🛑")
 
+BITRATE_MAP = {
+    "low": 96,
+    "medium": 160,
+    "high": 192,
+    "hq": 256,
+    "max": 320
+}
+
+def format_filesize(size: int) -> str:
+    """Pokazuje rozmiar pliku z jednostkami"""
+    units = ['B', 'KB', 'MB', 'GB', 'TB']
+    unit_index = 0
+
+    while size >= 1024 and unit_index < len(units) - 1:
+        size /= 1024
+        unit_index += 1
+
+    return f"{size:.1f} {units[unit_index]}"
 
 def open_folder(url: QUrl):
     path = url.toLocalFile()
@@ -67,6 +84,30 @@ def get_duration(file: str) -> float:
     ], capture_output=True, text=True)
 
     return float(result.stdout.strip())
+
+
+def choose_bitrate(yt_stream) -> int:
+    """
+    Dobiera bitrate na podstawie jakości źródła
+    """
+
+    abr = getattr(yt_stream, "abr", None)  # np. '128kbps'
+
+    if abr is None:
+        return 160  # fallback
+
+    abr_value = int(abr.replace("kbps", ""))
+
+    if abr_value <= 96:
+        return 128
+    elif abr_value <= 128:
+        return 160
+    elif abr_value <= 192:
+        return 192
+    elif abr_value <= 256:
+        return 256
+    else:
+        return 320
 
 
 class App(QWidget):
@@ -115,6 +156,7 @@ class App(QWidget):
         self.table = QTableWidget()
         self.table.setColumnCount(4)
         self.table.setHorizontalHeaderLabels(["id", "Info","St", "Status"])
+        self.table.setItemDelegateForColumn(3, ProgressDelegate(self.table))
         self.table.setColumnWidth(0, 60)
         self.table.setColumnWidth(1, 500)
         self.table.setColumnWidth(2, 20)
@@ -185,13 +227,11 @@ class App(QWidget):
         params = parse_qs(parsed.query)
         playlist = params.get("list", [None])[0]
 
-        if list:
+        if playlist:
             self.log(f"Playlista: {playlist}<br>")
-            print(f"Playlista: {playlist}")
             self.process_playlist(url)
         else:
-            self.log (f"Brak playlisty sprawdzam video")
-            self.log("Brak playlisty sprawdzam video")
+            self.log(f"Brak playlisty sprawdzam video<br>")
             self.process_video(url)
 
     def add_row(self, row_id: str, url: str, folder: Path):
@@ -203,7 +243,7 @@ class App(QWidget):
         # 1 - info
         self.table.setItem(row, 1, QTableWidgetItem(str(url)))
         # 3 - status
-        self.table.setItem(row, 3, QTableWidgetItem(''))
+        self.table.setItem(row, 3, ProgressItem("", 0))
         # 2 - button
         btn:QPushButton = QPushButton('')
         btn.setFlat(True)
@@ -213,6 +253,7 @@ class App(QWidget):
         self.set_data(row, ROLE_URL, url)
         self.set_data(row, ROLE_STATUS, STATUS_PENDING)
         self.set_data(row, ROLE_FOLDER, folder)
+        self.set_data(row, ROLE_PRECENT, 0)
         QApplication.processEvents()
         return row
 
@@ -229,7 +270,9 @@ class App(QWidget):
         status = self.get_data(row, ROLE_STATUS)
         if btn and item:
             btn.setText(status.icon)
-
+        progress=self.table.item(row, 3)
+        if progress:
+            progress.setPercent(self.get_data(row, ROLE_PRECENT))
         self.table.scrollToBottom()
         QApplication.processEvents()
 
@@ -247,6 +290,9 @@ class App(QWidget):
                 self.download_with_retry(row)
             except Exception as e:
                 self.update_row(row, f"Błąd YT: {str(e)}")
+                import traceback
+                traceback.print_exc()
+
         except Exception as e:
             self.log(f"Błąd pobierania video: {e}")
             import traceback
@@ -256,11 +302,12 @@ class App(QWidget):
         try:
             self.table.setRowCount(0)
             pl = Playlist(url=url)
-            self.log(f"<br><b>Playlista</b>: {pl.title}")
+            if not pl.video_urls:
+                raise Exception("Nie udało się załadować playlisty (Brak playlisty / CAPTCHA / brak dostępu)")
 
+            self.log(f"<br><b>Playlista</b>: {pl.title}")
             imax=len(pl.video_urls)
-            if imax < 1:
-                raise Exception("Link do playlisty nie zawiera filmów. Sprawdź captcha")
+
             id_start = self.start_input.value()
             self.log(f" Liczba filmów: {imax}, zaczynamy od {id_start}")
 
@@ -352,6 +399,7 @@ class App(QWidget):
         if self.mode_group.checkedId() == MODE_MP3:
             self.set_data(row, ROLE_STATUS, STATUS_CONVERSION)
             self.update_row(row, "Konwersja do mp3...")
+
             base = os.path.splitext(os.path.basename(filepath))[0]
             output_file = os.path.join(folder, base + ".mp3")
 
@@ -370,14 +418,18 @@ class App(QWidget):
 
     def on_progress(self, stream, chunk, bytes_remaining):
         total = stream.filesize
-        percent = int((1 - bytes_remaining / total) * 100)
-        self.update_row(self.current_row, f"Pobieranie {percent}%")
+        percent = (1 - bytes_remaining / total) * 100
+        self.set_data(self.current_row, ROLE_PRECENT, percent)
+        self.update_row(
+            self.current_row,
+            f"Pobieranie {percent:.0f}%, {format_filesize(total - bytes_remaining)} / {format_filesize(total)}"
+        )
         if self.stop_flag:
             raise Exception("Przerwane przez użytkownika")
 
     def log(self, msg: str):
         #self.output.append(msg)
-        print(msg)
+        print(re.sub(r"<[^>]*>", "", msg))
         self.output.setHtml(self.output.toHtml() + msg)
         self.output.verticalScrollBar().setValue(
             self.output.verticalScrollBar().maximum()
@@ -387,7 +439,7 @@ class App(QWidget):
             QApplication.processEvents()
             self._last_update = now
 
-    def convert_to_mp3(self, input_file, output_file, row:int) :
+    def convert_to_mp3(self, input_file, output_file, row:int, bitrate:int=160) :
         duration = get_duration(input_file)
         if duration == 0:
             raise Exception("Czas trwania pliku to 0s") 
@@ -398,7 +450,7 @@ class App(QWidget):
                 "-y",
                 "-i", input_file,
                 "-vn",
-                "-ab", "160k",
+                "-ab", f"{bitrate}k",
                 output_file,
                 "-progress", "pipe:1",
                 "-nostats"
@@ -418,13 +470,12 @@ class App(QWidget):
                 current = value / 1_000_000  # ms → sec
 
                 percent = (current / duration) * 100
-                self.update_row(row, f"Konwersja do mp3: {percent}%")
+                self.set_data(row, ROLE_PRECENT, percent)
+                self.update_row(row, f"Konwersja do mp3: {percent:.0f}%")
 
         process.wait()
 
-        return output_file
-
-    # Sprawdza czy jest ffmpeg i zwraca true jak jest
+        return process
 
 
 if __name__ == "__main__":
