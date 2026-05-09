@@ -2,18 +2,19 @@ from PyQt6.QtWidgets import QTableWidgetItem, QStyledItemDelegate, QStyle
 from PyQt6.QtCore import Qt, QRect, QPointF
 from PyQt6.QtGui import QColor, QLinearGradient
 
+DEFAULT_PROGRESSBAR_COLOR = "#96e5b8"
 
 class ProgressItem(QTableWidgetItem):
     """
     QTableWidgetItem z paskiem postępu w tle.
     Użycie:
         item = ProgressItem("Tekst", 50)  # 50% wypełnienia
-        item.setPercent(75)  # zmiana na 75%
-        item.setColor("#00ff00")  # zmiana koloru na zielony
+        item.set_percent(75)  # zmiana na 75%
+        item.set_progress_olor("#00ff00")  # zmiana koloru na zielony
         table.setItem(row, col, item)
     """
 
-    def __init__(self, text="", percent:float=0, color="#96e5b8"):
+    def __init__(self, text="", percent:float=0, color=DEFAULT_PROGRESSBAR_COLOR):
         super().__init__(text)
         self._percent: float = max(0.0, min(100.0, float(percent)))
         self._color = QColor(color)
@@ -93,7 +94,7 @@ class ProgressDelegate(QStyledItemDelegate):
 
         if item and isinstance(item, dict) and 'percent' in item:
             percent = item['percent']
-            color = item.get('color', QColor("#2ecc71"))
+            color = item.get('color', QColor(DEFAULT_PROGRESSBAR_COLOR))
 
             painter.save()
 

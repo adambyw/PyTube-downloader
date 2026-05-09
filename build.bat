@@ -1,0 +1,1 @@
+pyinstaller YT_Downloader.spec
