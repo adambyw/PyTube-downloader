@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QRadioButton, QButtonGroup, QHeaderView,
     QDialog, QDialogButtonBox, QPlainTextEdit
 )
-from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtCore import Qt, QUrl, QSettings
 from urllib.parse import urlparse, parse_qs
 from pytubefix import YouTube, Playlist
 from pathlib import Path
@@ -19,8 +19,53 @@ class UserBreakException(Exception):
     pass
 
 
-def safe_name(name):
-    return "".join(c for c in name if c not in r'\/:*?"<>|')
+def sanitize_filename(name: str) -> str:
+    """
+    Usuwa emoji i znaki niedozwolone w nazwach plików (Win/Linux/macOS).
+    Zachowuje litery narodowe (ą, ę, ü, ñ itp.).
+    Limit: 200 znaków (bezpieczny margines dla UTF-8 i rozszerzenia).
+    """
+    import unicodedata
+    result = []
+    for ch in name:
+        cat = unicodedata.category(ch)
+        if cat.startswith("C"):  # znaki sterujące
+            continue
+        if cat in ("So", "Sm", "Sk"):  # emoji / symbole matematyczne / modyfikatory
+            continue
+        if ch in r'\/:*?"<>|':  # znaki zakazane na Win/Linux/macOS
+            continue
+        result.append(ch)
+    name = "".join(result).strip(". ")
+    # Limit długości — 200 znaków to bezpieczny margines (systemy mają limit 255 bajtów,
+    # znaki UTF-8 mogą zajmować do 4 bajtów, plus rozszerzenie np. ".mp3")
+    name = name[:200].rstrip(". ")
+    return name or "plik"
+
+
+def safe_name(name: str) -> str:
+    return sanitize_filename(name)
+
+
+def apply_name_format(fmt: str, title: str, nr: str = "", ilosc: str = "", folder: str = "") -> str:
+    """Podstawia tokeny do szablonu nazwy pliku.
+    {nazwa}  - tytuł filmu
+    {nr}     - numer bez paddingu (1, 2, 3...)
+    {Nr}     - numer z zerami poprzedzającymi (01, 02... albo 001, 002...)
+    {ilość}  - łączna liczba plików
+    {folder} - nazwa podfolderu
+    """
+    if not fmt.strip():
+        return sanitize_filename(title)
+    width = len(str(ilosc)) if ilosc else 1
+    nr_padded = str(nr).zfill(width)
+    result = fmt
+    result = result.replace("{nazwa}", sanitize_filename(title))
+    result = result.replace("{Nr}", nr_padded)  # {Nr} przed {nr} żeby nie podmienić prefiksu
+    result = result.replace("{nr}", str(nr))
+    result = result.replace("{ilość}", str(ilosc))
+    result = result.replace("{folder}", sanitize_filename(folder))
+    return sanitize_filename(result)
 
 
 from dataclasses import dataclass
@@ -40,6 +85,9 @@ ROLE_URL = Qt.ItemDataRole.UserRole
 ROLE_STATUS = Qt.ItemDataRole.UserRole + 1
 ROLE_FOLDER = Qt.ItemDataRole.UserRole + 2
 ROLE_PRECENT = Qt.ItemDataRole.UserRole + 3
+ROLE_NAME_FORMAT = Qt.ItemDataRole.UserRole + 4
+ROLE_NR = Qt.ItemDataRole.UserRole + 5
+ROLE_ILOSC = Qt.ItemDataRole.UserRole + 6
 
 STATUS_FINISHED = Status(0, "✅")
 STATUS_PENDING = Status(1, "⏳")
@@ -262,6 +310,21 @@ class App(QWidget):
         radio_layout.addWidget(self.radio_video, alignment=Qt.AlignmentFlag.AlignLeft)
         radio_layout.addStretch()
 
+        # --- FORMAT NAZWY (globalny) ---
+        self.settings = QSettings("yt-downloader", "yt-downloader")
+
+        format_layout = QHBoxLayout()
+        format_label = QLabel("Format nazwy:")
+        format_label.setFixedWidth(90)
+        self.format_edit = QLineEdit()
+        self.format_edit.setText(self.settings.value("name_format", "{nazwa}"))
+        format_layout.addWidget(format_label)
+        format_layout.addWidget(self.format_edit)
+
+        hint_label = QLabel(
+            "<small>Tokeny: <b>{nazwa}</b> &nbsp; <b>{nr}</b> &nbsp; <b>{Nr}</b> (z zerami) &nbsp; <b>{ilość}</b> &nbsp; <b>{folder}</b> &nbsp;&nbsp; Przykład: <i>{Nr} - {nazwa}</i></small>")
+        hint_label.setTextFormat(Qt.TextFormat.RichText)
+
         # --- RESULT window ---
         self.output: QTextBrowser = QTextBrowser()
         self.output.setSizePolicy(
@@ -281,6 +344,8 @@ class App(QWidget):
 
         self.layout.addLayout(top_layout)
         self.layout.addLayout(radio_layout)
+        self.layout.addLayout(format_layout)
+        self.layout.addWidget(hint_label)
         self.layout.addWidget(self.splitter)
         self.setLayout(self.layout)
 
@@ -294,10 +359,11 @@ class App(QWidget):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             links = dialog.get_links()
             folder_name = dialog.get_folder_name()
+            name_format = self.format_edit.text().strip()
             if links:
-                self.process_batch(links, folder_name)
+                self.process_batch(links, folder_name, name_format)
 
-    def process_batch(self, urls: list[str], folder_name: str):
+    def process_batch(self, urls: list[str], folder_name: str, name_format: str = ""):
         try:
             self.table.setRowCount(0)
             downloads = Path.home() / "Downloads"
@@ -310,7 +376,8 @@ class App(QWidget):
 
             imax = len(urls)
             for i, url in enumerate(urls, start=1):
-                row = self.add_row(f"{i}/{imax}", url, batch_folder)
+                row = self.add_row(f"{i}/{imax}", url, batch_folder,
+                                   name_format=name_format, nr=str(i), ilosc=str(imax))
                 self.update_row(row)
 
             for row in range(self.table.rowCount()):
@@ -342,7 +409,8 @@ class App(QWidget):
             self.log(f"Brak playlisty sprawdzam video<br>")
             self.process_video(url)
 
-    def add_row(self, row_id: str, url: str, folder: Path):
+    def add_row(self, row_id: str, url: str, folder: Path,
+                name_format: str = "", nr: str = "", ilosc: str = ""):
         row = self.table.rowCount()
         self.table.insertRow(row)
 
@@ -362,6 +430,9 @@ class App(QWidget):
         self.set_data(row, ROLE_STATUS, STATUS_PENDING)
         self.set_data(row, ROLE_FOLDER, folder)
         self.set_data(row, ROLE_PRECENT, 0)
+        self.set_data(row, ROLE_NAME_FORMAT, name_format)
+        self.set_data(row, ROLE_NR, nr)
+        self.set_data(row, ROLE_ILOSC, ilosc)
         QApplication.processEvents()
         return row
 
@@ -393,7 +464,8 @@ class App(QWidget):
             path = str(playlist_folder)
             self.log(f"Folder zapisu: <a href='file:///{playlist_folder}'>{playlist_folder}</a>")
             self.stop_flag = False
-            row = self.add_row("1", url, playlist_folder)
+            name_format = self.format_edit.text().strip()
+            row = self.add_row("1", url, playlist_folder, name_format=name_format, nr="1", ilosc="1")
             try:
                 self.download_with_retry(row)
             except Exception as e:
@@ -425,9 +497,11 @@ class App(QWidget):
             path = str(playlist_folder)
             self.log(f"Folder zapisu: <a href='file:///{playlist_folder}'>{playlist_folder}</a>")
             self.stop_flag = False
+            name_format = self.format_edit.text().strip()
             urls = list(pl.video_urls)
             for i, url in enumerate(urls[0:], start=1):
-                row = self.add_row(f"{i}/{imax}", url, playlist_folder)
+                row = self.add_row(f"{i}/{imax}", url, playlist_folder,
+                                   name_format=name_format, nr=str(i), ilosc=str(imax))
                 if i < id_start:
                     self.set_data(row, ROLE_STATUS, STATUS_SKIPPED)
                 self.update_row(row)
@@ -494,9 +568,17 @@ class App(QWidget):
         self.current_row = row
         url = self.get_data(row, ROLE_URL)
         folder = self.get_data(row, ROLE_FOLDER)
+        name_format = self.get_data(row, ROLE_NAME_FORMAT) or ""
+        nr = self.get_data(row, ROLE_NR) or ""
+        ilosc = self.get_data(row, ROLE_ILOSC) or ""
 
         yt = YouTube(url, on_progress_callback=self.on_progress)
         self.update_row(row, yt.title, 1)
+
+        # Wyznacz docelową nazwę pliku
+        folder_name = Path(folder).name
+        final_name = apply_name_format(name_format, yt.title, nr, ilosc, folder_name)
+
         if self.mode_group.checkedId() == MODE_VIDEO:
             yt_file = yt.streams.filter(
                 adaptive=True,
@@ -518,8 +600,10 @@ class App(QWidget):
             self.set_data(row, ROLE_PRECENT, 0)
             self.update_row(row, "Konwersja do mp3...")
 
-            base = os.path.splitext(os.path.basename(filepath))[0]
-            output_file = os.path.join(folder, base + ".mp3")
+            output_file = os.path.join(folder, final_name + ".mp3")
+            # Jeśli plik o takiej nazwie już istnieje, dopisz suffix
+            if os.path.exists(output_file):
+                output_file = os.path.join(folder, final_name + f"_{nr or 0}.mp3")
 
             result = self.convert_to_mp3(filepath, output_file, row)
             if result.returncode:
@@ -531,7 +615,16 @@ class App(QWidget):
             os.remove(filepath)
             return output_file
         else:
-            return filepath
+            # Tryb VIDEO / AUDIO — zmień nazwę pobranego pliku na final_name
+            ext = os.path.splitext(filepath)[1]
+            renamed = os.path.join(folder, final_name + ext)
+            if filepath != renamed:
+                if os.path.exists(renamed):
+                    renamed = os.path.join(folder, final_name + f"_{nr or 0}" + ext)
+                os.rename(filepath, renamed)
+            self.set_data(row, ROLE_STATUS, STATUS_FINISHED)
+            self.update_row(row, f"zapisane {os.path.basename(renamed)}")
+            return renamed
 
     def on_progress(self, stream, chunk, bytes_remaining):
         total = stream.filesize
@@ -605,6 +698,10 @@ class App(QWidget):
         process.wait()
 
         return process
+
+    def closeEvent(self, event):
+        self.settings.setValue("name_format", self.format_edit.text())
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":
