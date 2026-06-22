@@ -11,7 +11,7 @@ a = Analysis(
     ['yt.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('icons', 'icons')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
