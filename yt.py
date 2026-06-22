@@ -1,3 +1,5 @@
+__version__ = "0.1.1"
+
 import sys, time, os, re, subprocess
 
 from PyQt6.QtGui import QIcon
