@@ -1,6 +1,14 @@
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 import sys, time, os, re, subprocess
+from pathlib import Path
+
+
+def resource_path(relative: str) -> str:
+    """Zwraca ścieżkę do zasobu — działa zarówno z PyInstaller jak i bez."""
+    base = getattr(sys, '_MEIPASS', Path(__file__).parent)
+    return str(Path(base) / relative)
+
 
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
@@ -226,7 +234,7 @@ class App(QWidget):
         self.stop_flag = False
         self.current_row: int | None = None
         self.setWindowTitle("YT Downloader")
-        self.setWindowIcon(QIcon('icons/app.png'))
+        self.setWindowIcon(QIcon(resource_path('icons/app.png')))
         self.resize(1000, 500)
 
         self.layout = QVBoxLayout()
