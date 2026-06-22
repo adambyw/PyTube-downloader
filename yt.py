@@ -5,7 +5,8 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QTextBrowser,
     QTableWidget, QTableWidgetItem, QSpinBox, QLabel, QSizePolicy, QSplitter,
-    QRadioButton, QButtonGroup, QHeaderView
+    QRadioButton, QButtonGroup, QHeaderView,
+    QDialog, QDialogButtonBox, QPlainTextEdit
 )
 from PyQt6.QtCore import Qt, QUrl
 from urllib.parse import urlparse, parse_qs
@@ -13,19 +14,25 @@ from pytubefix import YouTube, Playlist
 from pathlib import Path
 from progressbar import ProgressItem, ProgressDelegate
 
+
 class UserBreakException(Exception):
     pass
+
 
 def safe_name(name):
     return "".join(c for c in name if c not in r'\/:*?"<>|')
 
+
 from dataclasses import dataclass
+
+
 @dataclass
 class Status:
     code: int
     icon: str
 
-MODE_AUDIO =0
+
+MODE_AUDIO = 0
 MODE_MP3 = 1
 MODE_VIDEO = 2
 
@@ -34,13 +41,13 @@ ROLE_STATUS = Qt.ItemDataRole.UserRole + 1
 ROLE_FOLDER = Qt.ItemDataRole.UserRole + 2
 ROLE_PRECENT = Qt.ItemDataRole.UserRole + 3
 
-STATUS_FINISHED =    Status( 0, "✅")
-STATUS_PENDING =     Status( 1, "⏳")
-STATUS_DOWNLOADING = Status( 2, "🔽")
-STATUS_CONVERSION =  Status( 3, "🔄")
-STATUS_ERROR =       Status(-1, "❌")
-STATUS_USER_BREAK =  Status(-2, "🛑")
-STATUS_SKIPPED =     Status(-3, "➖")
+STATUS_FINISHED = Status(0, "✅")
+STATUS_PENDING = Status(1, "⏳")
+STATUS_DOWNLOADING = Status(2, "🔽")
+STATUS_CONVERSION = Status(3, "🔄")
+STATUS_ERROR = Status(-1, "❌")
+STATUS_USER_BREAK = Status(-2, "🛑")
+STATUS_SKIPPED = Status(-3, "➖")
 
 BITRATE_MAP = {
     "low": 96,
@@ -49,6 +56,7 @@ BITRATE_MAP = {
     "hq": 256,
     "max": 320
 }
+
 
 def format_filesize(size: int) -> str:
     """Pokazuje rozmiar pliku z jednostkami"""
@@ -61,13 +69,19 @@ def format_filesize(size: int) -> str:
 
     return f"{size:.1f} {units[unit_index]}"
 
+
 def open_folder(url: QUrl):
-    path = url.toLocalFile()
     import subprocess
-    if os.name == "nt":  # Windows
-        os.startfile(path)
-    elif os.name == "posix":  # Linux/Mac
-        subprocess.Popen(["xdg-open", path])
+    if url.scheme() == "file":
+        path = url.toLocalFile()
+        if os.name == "nt":
+            os.startfile(path)
+        else:
+            subprocess.Popen(["xdg-open", path])
+    else:
+        # http / https — otwórz w przeglądarce
+        from PyQt6.QtGui import QDesktopServices
+        QDesktopServices.openUrl(url)
 
 
 def check_ffmpeg() -> bool:
@@ -113,13 +127,54 @@ def choose_bitrate(yt_stream) -> int:
         return 320
 
 
+class BatchDownloadDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Pobierz listę linków")
+        self.resize(500, 380)
+
+        layout = QVBoxLayout(self)
+
+        # Pole na linki
+        lbl_links = QLabel("Lista linków (jeden na linię):")
+        layout.addWidget(lbl_links)
+
+        self.links_edit = QPlainTextEdit()
+        self.links_edit.setPlaceholderText(
+            "https://www.youtube.com/watch?v=...\nhttps://www.youtube.com/watch?v=...\n...")
+        layout.addWidget(self.links_edit)
+
+        # Pole na nazwę folderu
+        lbl_folder = QLabel("Nazwa podfolderu (opcjonalnie):")
+        layout.addWidget(lbl_folder)
+
+        self.folder_edit = QLineEdit()
+        self.folder_edit.setPlaceholderText("np. Muzyka 2024")
+        layout.addWidget(self.folder_edit)
+
+        # Przyciski Pobierz / Anuluj
+        buttons = QDialogButtonBox()
+        self.btn_pobierz = buttons.addButton("Pobierz", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.btn_anuluj = buttons.addButton("Anuluj", QDialogButtonBox.ButtonRole.RejectRole)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_links(self) -> list[str]:
+        text = self.links_edit.toPlainText()
+        return [line.strip() for line in text.splitlines() if line.strip()]
+
+    def get_folder_name(self) -> str:
+        return self.folder_edit.text().strip()
+
+
 class App(QWidget):
-    
+
     def __init__(self):
         super().__init__()
-        self._msg:str = ''
+        self._msg: str = ''
         self.stop_flag = False
-        self.current_row: int|None = None
+        self.current_row: int | None = None
         self.setWindowTitle("YT Downloader")
         self.setWindowIcon(QIcon('icons/app.png'))
         self.resize(1000, 500)
@@ -129,21 +184,26 @@ class App(QWidget):
         # --- TOP: input + btn_download ---
         top_layout = QHBoxLayout()
 
-        self.input:QLineEdit = QLineEdit()
+        self.btn_batch: QPushButton = QPushButton("☰")
+        self.btn_batch.setToolTip("Pobierz listę linków")
+        self.btn_batch.setFixedWidth(36)
+        self.btn_batch.clicked.connect(self.open_batch_dialog)
+
+        self.input: QLineEdit = QLineEdit()
         self.input.setPlaceholderText("Wpisz link do playlisty lub filu YT...")
 
-        self.btn_download: QPushButton= QPushButton("Pobierz")
+        self.btn_download: QPushButton = QPushButton("Pobierz")
         self.btn_download.clicked.connect(self.handle_pobierz)
 
         # enter jako submit
         self.input.returnPressed.connect(self.handle_pobierz)
 
-        #radio dla konwersji
+        # radio dla konwersji
         self.radio_mp3 = QRadioButton("Konwersja do .mp3")
         self.radio_m4a = QRadioButton("Format oryginalny (.m4a)")
         self.radio_video = QRadioButton("Wideo")
 
-        #sprawdza czy jest ffmpeg i udostępnia konwersję
+        # sprawdza czy jest ffmpeg i udostępnia konwersję
         if check_ffmpeg():
             self.radio_mp3.setChecked(True)
             self.log("ffpmeg obecne<br>")
@@ -151,17 +211,18 @@ class App(QWidget):
             self.radio_mp3.setEnabled(False)
             self.radio_m4a.setChecked(True)
             self.log("Brak ffmpeg do konwersji .mp3<br>")
-            self.log("Pobierz i zainstaluj bibliotekę ręcznie z <a href='https://ffmpeg.org/download.html'>https://ffmpeg.org/download.html</a>")
+            self.log(
+                "Pobierz i zainstaluj bibliotekę ręcznie z <a href='https://ffmpeg.org/download.html'>https://ffmpeg.org/download.html</a>")
 
         self.mode_group = QButtonGroup(self)
         self.mode_group.addButton(self.radio_mp3, MODE_MP3)
         self.mode_group.addButton(self.radio_m4a, MODE_AUDIO)
         self.mode_group.addButton(self.radio_video, MODE_VIDEO)
 
-        #tabela
+        # tabela
         self.table = QTableWidget()
         self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["id", "Info","St", "Status"])
+        self.table.setHorizontalHeaderLabels(["id", "Info", "St", "Status"])
         self.table.setItemDelegateForColumn(3, ProgressDelegate(self.table))
         self.table.setColumnWidth(0, 60)
         self.table.setColumnWidth(1, 500)
@@ -174,7 +235,7 @@ class App(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.table.setMinimumHeight(200)
 
-        #numer startowy
+        # numer startowy
         self.start_input_label = QLabel("Start od")
         self.start_input = QSpinBox()
         self.start_input.setRange(1, 9999)  # 4 cyfry
@@ -182,10 +243,11 @@ class App(QWidget):
         self.start_input.setFixedWidth(100)
         self.start_input.setButtonSymbols(QSpinBox.ButtonSymbols.UpDownArrows)
 
-        #btn_download stopu
+        # btn_download stopu
         self.stop_btn: QPushButton = QPushButton("STOP")
         self.stop_btn.clicked.connect(self.stop_download)
 
+        top_layout.addWidget(self.btn_batch)
         top_layout.addWidget(self.input)
         top_layout.addWidget(self.start_input_label)
         top_layout.addWidget(self.start_input)
@@ -200,15 +262,15 @@ class App(QWidget):
         radio_layout.addWidget(self.radio_video, alignment=Qt.AlignmentFlag.AlignLeft)
         radio_layout.addStretch()
 
-
         # --- RESULT window ---
-        self.output:QTextBrowser = QTextBrowser()
+        self.output: QTextBrowser = QTextBrowser()
         self.output.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding
         )
         self.output.setMaximumHeight(300)
         self.output.setOpenExternalLinks(False)
+        self.output.setOpenLinks(False)  # blokuje nawigację po kliknięciu
         self.output.anchorClicked.connect(open_folder)
 
         # --- LAYOUT ---
@@ -224,7 +286,44 @@ class App(QWidget):
 
         self._last_update = time.time()
 
-        self.log("<br><b>Gotowy</b><br>Wklej link do filmu lub playlisty youtube, wybierz format wyjściowy, kliknij Pobierz. Pliki znajdziesz w katalogu użytkownika Pobrane, link pojawi się poniżej. Playlisty będą się zapisywać w podfolderach.")
+        self.log(
+            "<br><b>Gotowy</b><br>Wklej link do filmu lub playlisty youtube, wybierz format wyjściowy, kliknij Pobierz. Pliki znajdziesz w katalogu użytkownika Pobrane, link pojawi się poniżej. Playlisty będą się zapisywać w podfolderach.")
+
+    def open_batch_dialog(self):
+        dialog = BatchDownloadDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            links = dialog.get_links()
+            folder_name = dialog.get_folder_name()
+            if links:
+                self.process_batch(links, folder_name)
+
+    def process_batch(self, urls: list[str], folder_name: str):
+        try:
+            self.table.setRowCount(0)
+            downloads = Path.home() / "Downloads"
+            subfolder = folder_name if folder_name else "yt-downloader"
+            batch_folder = downloads / subfolder
+            batch_folder.mkdir(parents=True, exist_ok=True)
+            self.log(f"<br><b>Pobieranie listy {len(urls)} linków</b>")
+            self.log(f"Folder zapisu: <a href='file:///{batch_folder}'>{batch_folder}</a>")
+            self.stop_flag = False
+
+            imax = len(urls)
+            for i, url in enumerate(urls, start=1):
+                row = self.add_row(f"{i}/{imax}", url, batch_folder)
+                self.update_row(row)
+
+            for row in range(self.table.rowCount()):
+                if self.stop_flag:
+                    break
+                try:
+                    self.download_with_retry(row)
+                except Exception as e:
+                    self.update_row(row, f"Błąd: {str(e)}")
+        except Exception as e:
+            self.log(f"Błąd pobierania listy: {e}")
+            import traceback
+            traceback.print_exc()
 
     def stop_download(self):
         self.stop_flag = True
@@ -254,7 +353,7 @@ class App(QWidget):
         # 3 - status
         self.table.setItem(row, 3, ProgressItem("", 0))
         # 2 - button
-        btn:QPushButton = QPushButton('')
+        btn: QPushButton = QPushButton('')
         btn.setFlat(True)
 
         btn.clicked.connect(lambda _, r=row: self.on_button_click(r))
@@ -266,8 +365,7 @@ class App(QWidget):
         QApplication.processEvents()
         return row
 
-
-    def update_row(self, row:int, msg: str = None, column: int=3):
+    def update_row(self, row: int, msg: str = None, column: int = 3):
         print(msg)
         item = self.table.item(row, column)
         if msg:
@@ -280,13 +378,13 @@ class App(QWidget):
         status = self.get_data(row, ROLE_STATUS)
         if btn and item:
             btn.setText(status.icon)
-        progress=self.table.item(row, 3)
+        progress = self.table.item(row, 3)
         if progress:
             progress.set_percent(self.get_data(row, ROLE_PRECENT))
         self.table.scrollToItem(self.table.item(row, 0))
         QApplication.processEvents()
 
-    def process_video(self, url:str):
+    def process_video(self, url: str):
         try:
             self.table.setRowCount(0)
             downloads = Path.home() / "Downloads"
@@ -295,7 +393,7 @@ class App(QWidget):
             path = str(playlist_folder)
             self.log(f"Folder zapisu: <a href='file:///{playlist_folder}'>{playlist_folder}</a>")
             self.stop_flag = False
-            row = self.add_row("1", url , playlist_folder )
+            row = self.add_row("1", url, playlist_folder)
             try:
                 self.download_with_retry(row)
             except Exception as e:
@@ -308,7 +406,7 @@ class App(QWidget):
             import traceback
             traceback.print_exc()
 
-    def process_playlist(self, url:str):
+    def process_playlist(self, url: str):
         try:
             self.table.setRowCount(0)
             pl = Playlist(url=url)
@@ -316,7 +414,7 @@ class App(QWidget):
                 raise Exception("Nie udało się załadować playlisty (Brak playlisty / CAPTCHA / brak dostępu)")
 
             self.log(f"<br><b>Playlista</b>: {pl.title}")
-            imax=len(pl.video_urls)
+            imax = len(pl.video_urls)
 
             id_start = self.start_input.value()
             self.log(f" Liczba filmów: {imax}, zaczynamy od {id_start}")
@@ -348,7 +446,7 @@ class App(QWidget):
             import traceback
             traceback.print_exc()
 
-    #zapisuje dane w wierszu
+    # zapisuje dane w wierszu
     def set_data(self, row: int, role, data):
         self.table.item(row, 0).setData(role, data)
 
@@ -356,7 +454,7 @@ class App(QWidget):
     def get_data(self, row: int, role):
         return self.table.item(row, 0).data(role)
 
-    def download_with_retry(self, row: int, retries: int=3):
+    def download_with_retry(self, row: int, retries: int = 3):
         last_error = None
 
         for attempt in range(1, retries + 1):
@@ -366,7 +464,7 @@ class App(QWidget):
 
                 ret = self.download_and_convert(row)
                 self.set_data(row, ROLE_STATUS, STATUS_FINISHED)
-                self.update_row(row,f"Zakończone: {Path(ret).name}")
+                self.update_row(row, f"Zakończone: {Path(ret).name}")
                 return ret
 
             except UserBreakException as e:
@@ -394,13 +492,13 @@ class App(QWidget):
         self.set_data(row, ROLE_PRECENT, 0)
         self.update_row(row, f"Pobieranie")
         self.current_row = row
-        url=self.get_data(row, ROLE_URL)
-        folder=self.get_data(row, ROLE_FOLDER)
+        url = self.get_data(row, ROLE_URL)
+        folder = self.get_data(row, ROLE_FOLDER)
 
         yt = YouTube(url, on_progress_callback=self.on_progress)
-        self.update_row(row, yt.title,1)
+        self.update_row(row, yt.title, 1)
         if self.mode_group.checkedId() == MODE_VIDEO:
-            yt_file=yt.streams.filter(
+            yt_file = yt.streams.filter(
                 adaptive=True,
                 only_video=False,
                 file_extension="mp4"
@@ -420,11 +518,10 @@ class App(QWidget):
             self.set_data(row, ROLE_PRECENT, 0)
             self.update_row(row, "Konwersja do mp3...")
 
-
             base = os.path.splitext(os.path.basename(filepath))[0]
             output_file = os.path.join(folder, base + ".mp3")
 
-            result=self.convert_to_mp3(filepath, output_file, row)
+            result = self.convert_to_mp3(filepath, output_file, row)
             if result.returncode:
                 raise Exception(result.stderr)
 
@@ -435,7 +532,6 @@ class App(QWidget):
             return output_file
         else:
             return filepath
-
 
     def on_progress(self, stream, chunk, bytes_remaining):
         total = stream.filesize
@@ -449,32 +545,33 @@ class App(QWidget):
             raise Exception("Przerwane przez użytkownika")
 
     def log(self, msg: str):
-        #self.output.append(msg)
         print(re.sub(r"<[^>]*>", "", msg))
         if hasattr(self, 'output') and self.output is not None:
-            # Jeśli bufor nie jest pusty, wyświetl go najpierw
             if self._msg:
-                self.output.setHtml(self.output.toHtml() + self._msg)
-                self._msg = ""  # Opróżnij bufor
-
-            # Wyświetl bieżącą wiadomość
-            self.output.setHtml(self.output.toHtml() + msg)
-            self.output.verticalScrollBar().setValue(
-                self.output.verticalScrollBar().maximum()
-            )
-
+                self._append_html(self._msg)
+                self._msg = ""
+            self._append_html(msg)
             now = time.time()
             if now - self._last_update > 0.05:
                 QApplication.processEvents()
                 self._last_update = now
         else:
-            # Output nie istnieje - dopisz do bufora
             self._msg += msg
 
-    def convert_to_mp3(self, input_file, output_file, row:int, bitrate:int=160) :
+    def _append_html(self, html: str):
+        """Dopisuje HTML na koniec bez przeładowania całego dokumentu."""
+        cursor = self.output.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        cursor.insertHtml(html)
+        self.output.setTextCursor(cursor)
+        self.output.verticalScrollBar().setValue(
+            self.output.verticalScrollBar().maximum()
+        )
+
+    def convert_to_mp3(self, input_file, output_file, row: int, bitrate: int = 160):
         duration = get_duration(input_file)
         if duration == 0:
-            raise Exception("Czas trwania pliku to 0s") 
+            raise Exception("Czas trwania pliku to 0s")
 
         process = subprocess.Popen(
             [
